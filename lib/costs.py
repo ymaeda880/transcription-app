@@ -1,5 +1,5 @@
 # lib/costs.py
-from config import MODEL_PRICES_USD
+from config.config import MODEL_PRICES_USD
 
 def estimate_chat_cost_usd(model: str, prompt_tokens: int, completion_tokens: int):
     """Chat料金（USD）を概算。価格未設定モデルは None。"""

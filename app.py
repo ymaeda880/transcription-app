@@ -1,7 +1,7 @@
 # app.py
 import streamlit as st
-from config import get_openai_api_key, DEFAULT_USDJPY
-from ui.sidebar import init_metrics_state, render_sidebar
+from config.config import get_openai_api_key, DEFAULT_USDJPY
+from ui.sidebarOld import init_metrics_state, render_sidebar
 
 st.set_page_config(page_title="Minutes Maker — Home", layout="wide")
 st.title("🎛️ Minutes Maker — Home")
@@ -29,4 +29,4 @@ st.markdown(
 )
 
 # サイドバー（どのページからでも同じ表示）
-render_sidebar()
+# render_sidebar()
