@@ -2,8 +2,11 @@
 import streamlit as st
 from config.config import get_openai_api_key, DEFAULT_USDJPY
 from ui.sidebarOld import init_metrics_state, render_sidebar
+from ui.style import hide_anchor_links
 
 st.set_page_config(page_title="Minutes Maker — Home", layout="wide")
+# 鎖アイコンを非表示にする
+hide_anchor_links()
 st.title("🎛️ Minutes Maker — Home")
 
 # 初期化

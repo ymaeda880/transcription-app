@@ -24,9 +24,11 @@ from lib.tokens import extract_tokens_from_response, debug_usage_snapshot  # ←
 from lib.prompts import SPEAKER_PREP, get_group, build_prompt
 from config.config import DEFAULT_USDJPY
 from config.config import MAX_COMPLETION_BY_MODEL
+from ui.style import disable_heading_anchors
 
 # ========================== 共通設定 ==========================
 st.set_page_config(page_title="③ 話者分離・整形（新）", page_icon="🎙️", layout="wide")
+disable_heading_anchors()
 st.title("③ 話者分離・整形（新）— 議事録の前処理")
 
 OPENAI_API_KEY = st.secrets.get("openai", {}).get("api_key") or st.secrets.get("OPENAI_API_KEY")
