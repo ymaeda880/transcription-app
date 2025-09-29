@@ -1,8 +1,8 @@
 # ------------------------------------------------------------
-# 📝 議事録作成（整形済みテキスト → 議事録）
+# 📝 議事録作成（整形済みテキスト → 議事録）— modern専用・リトライなし版
 # - ③の整形結果（話者分離済みテキスト）を入力に、構造化された議事録を作成
 # - プロンプトは lib/prompts.py の MINUTES_MAKER グループを使用
-# - 料金計算は lib.tokens の policy="billing" を既定に、切替も可能
+# - 料金計算は modern usage（input/output/total）に統一
 # - .txt に加えて .docx（Word）入力にも対応
 # - ✅ 生成した議事録を .txt / .docx で保存できるダウンロードボタンを追加
 # - ✅ 生成結果は session_state から常時レンダリング（保存ボタン後も消えない）
@@ -26,9 +26,9 @@ except Exception:
 
 # ==== 共通ユーティリティ ====
 from lib.prompts import MINUTES_MAKER, get_group, build_prompt
-from lib.tokens import extract_tokens_from_response, debug_usage_snapshot
-from lib.costs import estimate_chat_cost_usd
-from config.config import DEFAULT_USDJPY, MAX_COMPLETION_BY_MODEL
+from lib.tokens import extract_tokens_from_response, debug_usage_snapshot  # modern専用
+from lib.costs import estimate_chat_cost_usd  # def(model, input_tokens, output_tokens)
+from config.config import DEFAULT_USDJPY
 
 # ========================== 共通設定 ==========================
 st.set_page_config(page_title="④ 議事録作成", page_icon="📝", layout="wide")
@@ -41,7 +41,7 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---- セッション初期化（表示が消えない用の保険） ----
+# ---- セッション初期化（表示が消えない用の保険）----
 st.session_state.setdefault("minutes_final_output", "")
 
 # ========================== モデル設定補助 ==========================
@@ -102,11 +102,8 @@ with left:
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
-            "gpt-4o-mini",
-            "gpt-4o",
             "gpt-4.1-mini",
             "gpt-4.1",
-            "gpt-3.5-turbo",
         ],
         index=1,
     )
@@ -121,24 +118,10 @@ with left:
     if not temp_supported:
         st.caption("ℹ️ GPT-5 系列は temperature を変更できません（=1固定）")
 
-    default_max = MAX_COMPLETION_BY_MODEL.get(model, 2000)
-    max_completion_tokens = st.number_input(
-        "max_completion_tokens（出力上限）",
-        min_value=256, max_value=128000, value=default_max, step=256,
-        help="議事録本体は数千トークンに収まる想定。長文化する場合は増枠。",
-    )
-
-    st.subheader("トークン算定ポリシー（料金計算用）")
-    policy = st.selectbox(
-        "policy",
-        options=["billing", "prefer_completion", "prefer_output", "auto"],
-        index=0,
-        help=(
-            "billing: 入力=input_tokens優先/出力=completion_tokens優先（推奨）\n"
-            "prefer_completion: 旧APIに近い感覚（出力=completion優先）\n"
-            "prefer_output: modernの定義に忠実（出力=output優先）\n"
-            "auto: modern優先→legacyへフォールバック"
-        ),
+    max_completion_tokens = st.slider(
+        "最大出力トークン（目安）",
+        min_value=1000, max_value=40000, value=12000, step=500,
+        help="長めの議事録生成なら 8,000〜12,000 程度を推奨（本版はリトライなし）。",
     )
 
     st.subheader("通貨換算（任意）")
@@ -160,7 +143,7 @@ with right:
         # .docx の場合は python-docx で抽出、.txt はそのまま読み取り
         if up.name.lower().endswith(".docx"):
             if not HAS_DOCX:
-                st.error("`.docx` を読み込むには python-docx が必要です。環境にインストールしてください（pip install python-docx）。")
+                st.error("`.docx` を読み込むには python-docx が必要です。`pip install python-docx` を実行してください。")
             else:
                 data = up.read()
                 try:
@@ -190,7 +173,7 @@ with right:
         placeholder="「③ 話者分離・整形（新）」の結果を流し込む想定です。",
     )
 
-# ========================== 実行（モデル呼び出し） ==========================
+# ========================== 実行（モデル呼び出し：リトライなし） ==========================
 if run_btn:
     if not src.strip():
         st.warning("整形済みテキストを入力してください。")
@@ -229,22 +212,12 @@ if run_btn:
                 except Exception:
                     finish_reason = None
 
-            # 出力不足時は自動で増枠して1回リトライ
-            if (not text.strip()) or (finish_reason == "length"):
-                bumped = int(min(max_completion_tokens * 1.5, 12000))
-                if bumped > max_completion_tokens:
-                    st.info(f"max_completion_tokens を {max_completion_tokens} → {bumped} に増枠して再実行します。")
-                    resp = call_once(combined, bumped)
-                    try:
-                        text = resp.choices[0].message.content or ""
-                    except Exception:
-                        text = getattr(resp.choices[0], "text", "")
-
         elapsed = time.perf_counter() - t0
 
         if text.strip():
-            # ← ここでは画面表示はせず、state に保存のみ（再実行後も残す）
             st.session_state["minutes_final_output"] = text
+            if finish_reason == "length":
+                st.info("finish_reason=length: 出力が上限で切れています。必要に応じて最大出力トークンを増やしてください。")
         else:
             st.warning("⚠️ モデルから空の応答が返されました。レスポンス全体を表示します。")
             try:
@@ -252,25 +225,25 @@ if run_btn:
             except Exception:
                 st.write(resp)
 
-        # === トークン算出（料金計算向け policy を適用） ===
+        # === トークン算出（modern専用） ===
         if 'resp' in locals():
-            ptok, ctok, ttot = extract_tokens_from_response(resp, policy=policy)
-            usd = estimate_chat_cost_usd(model, ptok, ctok)
+            input_tok, output_tok, total_tok = extract_tokens_from_response(resp)
+            usd = estimate_chat_cost_usd(model, input_tok, output_tok)
             jpy = (usd * usd_jpy) if usd is not None else None
 
-            # ===== 横並びの表で要約表示 =====
+            # ===== 概要テーブル =====
             metrics_data = {
                 "処理時間": [f"{elapsed:.2f} 秒"],
-                "入力トークン": [f"{ptok:,}"],
-                "出力トークン": [f"{ctok:,}"],
-                "合計トークン": [f"{ttot:,}"],
+                "入力トークン": [f"{input_tok:,}"],
+                "出力トークン": [f"{output_tok:,}"],
+                "合計トークン": [f"{total_tok:,}"],
                 "概算 (USD/JPY)": [f"${usd:,.6f} / ¥{jpy:,.2f}" if usd is not None else "—"],
             }
             st.subheader("トークンと料金の概要")
             st.table(pd.DataFrame(metrics_data))
 
-            # === デバッグ用：RAW usage を確認 ===
-            with st.expander("🔍 トークン算出の内訳（RAW usage スナップショット）"):
+            # === デバッグ用：modern usage スナップショット ===
+            with st.expander("🔍 トークン算出の内訳（modern usage スナップショット）"):
                 try:
                     st.write(debug_usage_snapshot(getattr(resp, "usage", None)))
                 except Exception as e:

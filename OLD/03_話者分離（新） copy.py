@@ -1,12 +1,13 @@
 # ------------------------------------------------------------
-# 🎙️ 話者分離・整形（議事録の前処理）— modern専用・リトライなし版
+# 🎙️ 話者分離・整形（議事録の前処理）
 # - .txt をドラッグ＆ドロップ or 貼り付け
 # - LLMで話者推定（S1/S2/...）＋発話ごとに改行・整形
 # - GPT-5 系列は temperature を変更不可（=1固定）→ UI 無効化＆API未送信
-# - 長文（~2万文字）対応：max_completion_tokens は大きめに設定して一発実行
+# - 長文（~2万文字）対応：max_completion_tokens を 10000 をデフォルトに
 # - 空応答時は resp 全体を st.json で出してデバッグ
+# - finish_reason=="length" のときは自動で max_completion_tokens を増枠して再実行
 # - ✅ 料金計算: lib.costs.estimate_chat_cost_usd（config.MODEL_PRICES_USD 参照）
-# - ✅ トークン取得: lib.tokens.extract_tokens_from_response（modern専用）
+# - ✅ トークン取得: lib.tokens.extract_tokens_from_response（policy 選択可）
 # - ✅ プロンプト管理: lib/prompts.py のレジストリに統一
 # ------------------------------------------------------------
 from __future__ import annotations
@@ -19,9 +20,10 @@ from openai import OpenAI
 
 # ==== 共通ユーティリティ ====
 from lib.costs import estimate_chat_cost_usd
-from lib.tokens import extract_tokens_from_response, debug_usage_snapshot
+from lib.tokens import extract_tokens_from_response, debug_usage_snapshot  # ← 追加
 from lib.prompts import SPEAKER_PREP, get_group, build_prompt
 from config.config import DEFAULT_USDJPY
+from config.config import MAX_COMPLETION_BY_MODEL
 from ui.style import disable_heading_anchors
 
 # ========================== 共通設定 ==========================
@@ -88,8 +90,11 @@ with left:
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
+            "gpt-4o-mini",
+            "gpt-4o",
             "gpt-4.1-mini",
             "gpt-4.1",
+            "gpt-3.5-turbo",
         ],
         index=1,
     )
@@ -104,11 +109,25 @@ with left:
     if not temp_supported:
         st.caption("ℹ️ GPT-5 系列は temperature を変更できません（=1固定）")
 
-    # 出力上限（modern専用）
-    max_completion_tokens = st.slider(
-        "最大出力トークン（目安）",
-        min_value=1000, max_value=40000, value=12000, step=500,
-        help="2万文字級の整形なら 8,000〜12,000 程度を推奨（本版はリトライなし）。",
+    default_max = MAX_COMPLETION_BY_MODEL.get(model, 10000)
+    max_completion_tokens = st.number_input(
+        "max_completion_tokens（出力上限）",
+        min_value=256, max_value=128000, value=default_max, step=512,
+        help="2万文字なら 8000〜10000 推奨。finish_reason=length の場合は自動で増枠します。",
+    )
+
+    # ★ 料金計算向け：トークン算定ポリシー
+    st.subheader("トークン算定ポリシー（料金計算用）")
+    policy = st.selectbox(
+        "policy",
+        options=["billing", "prefer_completion", "prefer_output", "auto"],
+        index=0,
+        help=(
+            "billing: 入力=input_tokens優先/出力=completion_tokens優先（推奨）\n"
+            "prefer_completion: 旧APIに近い感覚（出力=completion優先）\n"
+            "prefer_output: modernの定義に忠実（出力=output優先）\n"
+            "auto: modern優先→legacyへフォールバック"
+        ),
     )
 
     st.subheader("通貨換算（任意）")
@@ -142,7 +161,7 @@ with right:
         placeholder="①ページの結果を引き継ぐか、ここに貼り付けるか、.txt をドロップしてください。",
     )
 
-# ========================== 実行（リトライなし一発実行） ==========================
+# ========================== 実行 ==========================
 if run_btn:
     if not src.strip():
         st.warning("文字起こしテキストを入力してください。")
@@ -173,7 +192,6 @@ if run_btn:
             text = ""
             finish_reason = None
             if resp and getattr(resp, "choices", None):
-                # 出力テキストの取り出し（リトライなし）
                 try:
                     text = resp.choices[0].message.content or ""
                 except Exception:
@@ -183,13 +201,24 @@ if run_btn:
                 except Exception:
                     finish_reason = None
 
+            # 自動リトライ: 出力不足なら増枠
+            if (not text.strip()) or (finish_reason == "length"):
+                bumped = int(min(max_completion_tokens * 1.5, 12000))
+                if bumped > max_completion_tokens:
+                    st.info(f"max_completion_tokens を {max_completion_tokens} → {bumped} に増やして再実行します。")
+                    resp = call_once(combined, bumped)
+                    try:
+                        text = resp.choices[0].message.content or ""
+                    except Exception:
+                        text = getattr(resp.choices[0], "text", "")
+
         elapsed = time.perf_counter() - t0
 
         if text.strip():
             st.markdown("### ✅ 整形結果")
             st.markdown(text)
 
-            # === ダウンロード & コピー ===
+            # === 追加: ダウンロード & コピー ===
             import json
             base_filename = "speaker_prep_result"
             txt_bytes = text.encode("utf-8")
@@ -238,27 +267,30 @@ if run_btn:
             except Exception:
                 st.write(resp)
 
-        # === トークン算出（modern専用） ===
-        input_tok, output_tok, total_tok = extract_tokens_from_response(resp)
+        # === トークン算出（料金計算向け policy を適用） ===
+        ptok, ctok, ttot = extract_tokens_from_response(resp, policy=policy)
 
-        # 料金見積り（modern専用: input/output）
-        usd = estimate_chat_cost_usd(model, input_tok, output_tok)
+        # 料金見積り
+        usd = estimate_chat_cost_usd(model, ptok, ctok)
         jpy = (usd * usd_jpy) if usd is not None else None
 
         import pandas as pd
+
+        # まとめて表にする
         metrics_data = {
             "処理時間": [f"{elapsed:.2f} 秒"],
-            "入力トークン": [f"{input_tok:,}"],
-            "出力トークン": [f"{output_tok:,}"],
-            "合計トークン": [f"{total_tok:,}"],
+            "入力トークン": [f"{ptok:,}"],
+            "出力トークン": [f"{ctok:,}"],
+            "合計トークン": [f"{ttot:,}"],
             "概算 (USD/JPY)": [f"${usd:,.6f} / ¥{jpy:,.2f}" if usd is not None else "—"],
         }
         df_metrics = pd.DataFrame(metrics_data)
         st.subheader("トークンと料金の概要")
-        st.table(df_metrics)
+        st.table(df_metrics)   # 静的表（コピーしやすい）
+        # st.dataframe(df_metrics)  # ←インタラクティブにしたいならこちら
 
-        # === デバッグ用：modern usage スナップショット ===
-        with st.expander("🔍 トークン算出の内訳（modern usage スナップショット）"):
+        # === デバッグ用：RAW usage を確認 ===
+        with st.expander("🔍 トークン算出の内訳（RAW usage スナップショット）"):
             try:
                 st.write(debug_usage_snapshot(getattr(resp, "usage", None)))
             except Exception as e:
@@ -280,8 +312,8 @@ if push_btn:
 with st.expander("⚠️ 長文入力（2万文字前後）の注意点"):
     st.markdown(
         """
-- 日本語2万文字は **約1万〜1.5万トークン**です。**gpt-4.1 系 / gpt-5 系**（128kコンテキスト）推奨。
-- **max_completion_tokens** は 8000〜12000 程度が安全です（本版はリトライなし。必要に応じて最初から十分大きく）。
+- 日本語2万文字は **約1万〜1.5万トークン**です。**gpt-4.1 / gpt-4o / gpt-5 系**（128kコンテキスト）推奨。
+- **max_completion_tokens** は 8000〜10000 程度が安全です。finish_reason=length なら自動で増枠します。
 - 価格表は `config.MODEL_PRICES_USD`（USD/100万トークン）を運用価格に合わせて調整してください。
 """
     )

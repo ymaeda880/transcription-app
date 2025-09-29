@@ -1,38 +1,18 @@
 """
-tokens.py — Billing-optimized token extraction helpers.
+tokens.py — modern API 専用のトークン抽出ヘルパー（シンプル版）
 
-Goal:
-  - Provide stable, predictable (input, output, total) token counts for COST ESTIMATION.
-  - Cope with OpenAI usage schema variants across SDKs/APIs:
-    - modern:  input_tokens / output_tokens / total_tokens
-    - legacy:  prompt_tokens / completion_tokens / total_tokens
+前提:
+  - OpenAI の modern 系 usage スキーマのみを扱う。
+  - usage = { input_tokens, output_tokens, total_tokens } を想定。
+  - legacy 系（prompt_tokens / completion_tokens）は未対応（=0扱い）。
 
-Policy:
-  - Default policy="billing":
-      input  := input_tokens  if present else prompt_tokens
-      output := completion_tokens if present else output_tokens
-    Rationale: completion_tokens is closest to "generated text" for many models,
-    while input_tokens covers billing for modern APIs; prompt_tokens is used as fallback.
-
-  - policy="auto":
-      Prefer modern keys (input/output). If missing, fall back to legacy (prompt/completion).
-      This matches your earlier implementation and is useful for diagnostics.
-
-  - policy="prefer_completion":
-      input  := prompt_tokens  if present else input_tokens
-      output := completion_tokens if present else output_tokens
-
-  - policy="prefer_output":
-      input  := input_tokens  if present else prompt_tokens
-      output := output_tokens if present else completion_tokens
-
-Notes:
-  - We NEVER invent tokens. If total_tokens is absent, we compute total := input + output.
-  - If usage is missing or malformed, we safely return zeros.
+方針:
+  - usage が無い／欠損している場合でも安全に 0 を返す。
+  - total_tokens が無ければ input_tokens + output_tokens で補完する。
 """
 
 from __future__ import annotations
-from typing import Any, NamedTuple, Literal, Dict
+from typing import Any, NamedTuple, Dict
 
 
 class Tokens(NamedTuple):
@@ -41,138 +21,79 @@ class Tokens(NamedTuple):
     total: int
 
 
-def _get_attr(obj: Any, name: str):
-    try:
-        return getattr(obj, name)
-    except Exception:
-        return None
-
-
-def _coerce_int(x: Any) -> int:
+def _as_int(x: Any) -> int:
     try:
         return int(x)
     except Exception:
         return 0
 
 
-def _read_usage_fields(usage_obj: Any) -> Dict[str, Any]:
+def _read_usage_modern(usage_obj: Any) -> Dict[str, int]:
     """
-    Read both modern and legacy token fields from a usage object (dict or obj).
-    Returns a dict with possibly-None fields:
-      input_tokens, output_tokens, prompt_tokens, completion_tokens, total_tokens
+    modern スキーマの usage から input/output/total を読み取って int に積み替える。
+    usage_obj は dict でも属性オブジェクトでもよい。
+    欠損は 0 として扱う。
     """
     if usage_obj is None:
-        return {
-            "input_tokens": None,
-            "output_tokens": None,
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-        }
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    # Try attributes (Pydantic/object) first
-    input_tok  = _get_attr(usage_obj, "input_tokens")
-    output_tok = _get_attr(usage_obj, "output_tokens")
-    prompt_tok = _get_attr(usage_obj, "prompt_tokens")
-    compl_tok  = _get_attr(usage_obj, "completion_tokens")
-    total_tok  = _get_attr(usage_obj, "total_tokens")
+    # 属性アクセス優先
+    def _get(name: str):
+        try:
+            return getattr(usage_obj, name)
+        except Exception:
+            return None
 
-    # If dict, fill missing via .get
+    input_tok  = _get("input_tokens")
+    output_tok = _get("output_tokens")
+    total_tok  = _get("total_tokens")
+
+    # dict の場合に補完
     if isinstance(usage_obj, dict):
         if input_tok  is None: input_tok  = usage_obj.get("input_tokens")
         if output_tok is None: output_tok = usage_obj.get("output_tokens")
-        if prompt_tok is None: prompt_tok = usage_obj.get("prompt_tokens")
-        if compl_tok  is None: compl_tok  = usage_obj.get("completion_tokens")
         if total_tok  is None: total_tok  = usage_obj.get("total_tokens")
 
     return {
-        "input_tokens": input_tok,
-        "output_tokens": output_tok,
-        "prompt_tokens": prompt_tok,
-        "completion_tokens": compl_tok,
-        "total_tokens": total_tok,
+        "input_tokens":  _as_int(input_tok),
+        "output_tokens": _as_int(output_tok),
+        "total_tokens":  _as_int(total_tok),
     }
 
 
-def extract_tokens(usage_obj: Any,
-                   policy: Literal["billing","auto","prefer_completion","prefer_output"]="billing"
-                  ) -> Tokens:
+def extract_tokens_from_usage(usage_obj: Any) -> Tokens:
     """
-    Extract (input, output, total) token counts from a usage object for COST ESTIMATION.
-
-    Args:
-      usage_obj: dict or object that may carry token fields.
-      policy: selection rule described in the module docstring.
-
-    Returns:
-      Tokens(input, output, total)
+    usage から (input, output, total) を抽出して返す（modern 専用）。
+    total が 0 または欠損なら input + output で補完する。
     """
-    fields = _read_usage_fields(usage_obj)
-    in_m  = fields["input_tokens"]
-    out_m = fields["output_tokens"]
-    in_l  = fields["prompt_tokens"]
-    out_l = fields["completion_tokens"]
-    tot   = fields["total_tokens"]
-
-    # Decide input/output by policy
-    if policy == "prefer_completion":
-        ptok = in_l if in_l is not None else in_m
-        ctok = out_l if out_l is not None else out_m
-    elif policy == "prefer_output":
-        ptok = in_m if in_m is not None else in_l
-        ctok = out_m if out_m is not None else out_l
-    elif policy == "auto":
-        # Prefer modern; fall back to legacy
-        ptok = in_m if in_m is not None else in_l
-        ctok = out_m if out_m is not None else out_l
-    else:  # "billing" (default)
-        # Input: modern then legacy; Output: legacy (completion) then modern
-        ptok = in_m if in_m is not None else in_l
-        ctok = out_l if out_l is not None else out_m
-
-    # Coerce to ints and compute total if missing
-    ptok_i = _coerce_int(ptok)
-    ctok_i = _coerce_int(ctok)
-    total_i = _coerce_int(tot) if tot is not None else (ptok_i + ctok_i)
-
-    return Tokens(ptok_i, ctok_i, total_i)
+    f = _read_usage_modern(usage_obj)
+    input_i  = f["input_tokens"]
+    output_i = f["output_tokens"]
+    total_i  = f["total_tokens"] or (input_i + output_i)
+    return Tokens(input_i, output_i, total_i)
 
 
-# Backward-compatible alias
-_extract_tokens = extract_tokens
-
-
-def extract_tokens_from_response(resp: Any,
-                                 policy: Literal["billing","auto","prefer_completion","prefer_output"]="billing"
-                                ) -> Tokens:
+def extract_tokens_from_response(resp: Any) -> Tokens:
     """
-    Convenience: read resp.usage and apply the same policy.
+    レスポンス resp から resp.usage を取り出して extract_tokens_from_usage を適用。
+    usage が無い場合は (0,0,0)。
     """
     if resp is None:
         return Tokens(0, 0, 0)
-
-    usage = None
-    try:
-        usage = getattr(resp, "usage")
-    except Exception:
-        usage = None
-
+    usage = getattr(resp, "usage", None)
     if usage is None and isinstance(resp, dict):
         usage = resp.get("usage")
-
-    return extract_tokens(usage, policy=policy)
+    return extract_tokens_from_usage(usage)
 
 
 def debug_usage_snapshot(usage_obj: Any) -> Dict[str, int]:
     """
-    Return a normalized snapshot of usage fields (ints with zeros for missing)
-    to help debug discrepancies.
+    modern フィールドだけを整数化して返すスナップショット。
+    （legacy フィールドは無視）
     """
-    f = _read_usage_fields(usage_obj)
+    f = _read_usage_modern(usage_obj)
     return {
-        "input_tokens":      _coerce_int(f["input_tokens"]),
-        "output_tokens":     _coerce_int(f["output_tokens"]),
-        "prompt_tokens":     _coerce_int(f["prompt_tokens"]),
-        "completion_tokens": _coerce_int(f["completion_tokens"]),
-        "total_tokens":      _coerce_int(f["total_tokens"]),
+        "input_tokens":  f["input_tokens"],
+        "output_tokens": f["output_tokens"],
+        "total_tokens":  f["total_tokens"] or (f["input_tokens"] + f["output_tokens"]),
     }

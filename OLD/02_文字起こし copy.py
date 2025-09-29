@@ -75,7 +75,7 @@ with col_left:
     # ---- モデル選択（ラジオボタン） ----
     model = st.radio(
         "モデル",
-        options=["whisper-1","gpt-4o-mini-transcribe", "gpt-4o-transcribe"],
+        options=["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "whisper-1"],
         index=0,
         help="コスト/速度重視なら mini、精度重視なら 4o-transcribe、互換重視なら whisper-1。",
     )
@@ -136,26 +136,22 @@ if go:
 
     mime = uploaded.type or "application/octet-stream"
     files = {"file": (uploaded.name, file_bytes, mime)}
-
-    # ---- ここを変更：空文字は送らない（prompt/language を条件付きで付与） ----
-    data: dict = {
-        "model": model,               # ラジオ選択値をそのまま利用
+    data = {
+        "model": model,  # ← ラジオ選択値をそのまま利用
         "response_format": fmt,
+        "prompt": (prompt_hint or "").strip(),
     }
-    if prompt_hint and prompt_hint.strip():
-        data["prompt"] = prompt_hint.strip()
-    if language and language.strip():
+    if language.strip():
         data["language"] = language.strip()
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
     sess = requests.Session()
-    # ---- ここを変更：allowed_methods を frozenset({"POST"}) に ----
     retries = Retry(
         total=3,
         backoff_factor=1.2,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=frozenset({"POST"}),
+        allowed_methods=["POST"],
     )
     sess.mount("https://", HTTPAdapter(max_retries=retries))
 
@@ -237,7 +233,7 @@ if go:
     if audio_min is not None:
         price_per_min = TRANSCRIBE_PRICES_USD_PER_MIN.get(model, WHISPER_PRICE_PER_MIN)
         usd = float(audio_min) * float(price_per_min)
-        jpy = usd * float(st.session_state["usd_jpy"])
+        jpy = usd * float(usd_jpy)
 
     metrics_data = {
         "処理時間": [f"{elapsed:.2f} 秒"],
